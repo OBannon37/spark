@@ -26,43 +26,44 @@ import org.apache.spark.api.python.ChainedPythonFunctions
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.execution.{SparkPlan, UnaryExecNode}
 import org.apache.spark.sql.types.{DataType, StructField, StructType}
 import org.apache.spark.util.Utils
 
 
 /**
- * A physical plan that evaluates a [[PythonUDF]], one partition of tuples at a time.
- *
- * Python evaluation works by sending the necessary (projected) input data via a socket to an
- * external Python process, and combine the result from the Python process with the original row.
- *
- * For each row we send to Python, we also put it in a queue first. For each output row from Python,
- * we drain the queue to find the original input row. Note that if the Python process is way too
- * slow, this could lead to the queue growing unbounded and spill into disk when run out of memory.
- *
- * Here is a diagram to show how this works:
- *
- *            Downstream (for parent)
- *             /      \
- *            /     socket  (output of UDF)
- *           /         \
- *        RowQueue    Python
- *           \         /
- *            \     socket  (input of UDF)
- *             \     /
- *          upstream (from child)
- *
- * The rows sent to and received from Python are packed into batches (100 rows) and serialized,
- * there should be always some rows buffered in the socket or Python process, so the pulling from
- * RowQueue ALWAYS happened after pushing into it.
- */
-abstract class EvalPythonExec(udfs: Seq[PythonUDF], output: Seq[Attribute], child: SparkPlan)
-  extends SparkPlan {
+* A physical plan that evaluates a [[PythonUDF]], one partition of tuples at a time.
+*
+* Python evaluation works by sending the necessary (projected) input data via a socket to an
+* external Python process, and combine the result from the Python process with the original row.
+*
+* For each row we send to Python, we also put it in a queue first. For each output row from Python,
+* we drain the queue to find the original input row. Note that if the Python process is way too
+* slow, this could lead to the queue growing unbounded and spill into disk when run out of memory.
+*
+* Here is a diagram to show how this works:
+*
+*            Downstream (for parent)
+*             /      \
+*            /     socket  (output of UDF)
+*           /         \
+*        RowQueue    Python
+*           \         /
+*            \     socket  (input of UDF)
+*             \     /
+*          upstream (from child)
+*
+* The rows sent to and received from Python are packed into batches (100 rows) and serialized,
+* there should be always some rows buffered in the socket or Python process, so the pulling from
+* RowQueue ALWAYS happened after pushing into it.
+*/
 
-  def children: Seq[SparkPlan] = child :: Nil
+abstract class EvalPythonExec(udfs: Seq[PythonUDF], resultAttrs: Seq[Attribute], child: SparkPlan)
+  extends UnaryExecNode {
 
-  override def producedAttributes: AttributeSet = AttributeSet(output.drop(child.output.length))
+  override def output: Seq[Attribute] = child.output ++ resultAttrs
+
+  override def producedAttributes: AttributeSet = AttributeSet(resultAttrs)
 
   private def collectFunctions(udf: PythonUDF): (ChainedPythonFunctions, Seq[Expression]) = {
     udf.children match {
@@ -77,11 +78,11 @@ abstract class EvalPythonExec(udfs: Seq[PythonUDF], output: Seq[Attribute], chil
   }
 
   protected def evaluate(
-      funcs: Seq[ChainedPythonFunctions],
-      argOffsets: Array[Array[Int]],
-      iter: Iterator[InternalRow],
-      schema: StructType,
-      context: TaskContext): Iterator[InternalRow]
+                          funcs: Seq[ChainedPythonFunctions],
+                          argOffsets: Array[Array[Int]],
+                          iter: Iterator[InternalRow],
+                          schema: StructType,
+                          context: TaskContext): Iterator[InternalRow]
 
   protected override def doExecute(): RDD[InternalRow] = {
     val inputRDD = child.execute().map(_.copy())
